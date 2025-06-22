@@ -1,0 +1,8 @@
+C_MTEB
+chromadb
+mteb
+numpy
+sentence_transformers
+torch
+tqdm
+transformers
