@@ -8,7 +8,7 @@ from sentence_transformers import (
 from sentence_transformers.losses import MatryoshkaLoss
 
 torch.backends.cuda.enable_flash_sdp(True)
-from bge_large_se_mrl_helper import *
+from bge_large_se_mrl_helper_optimized_kernal import *
 from transformers import TrainerCallback, TrainerState, TrainerControl
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
