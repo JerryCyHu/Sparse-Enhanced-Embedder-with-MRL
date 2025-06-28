@@ -10,16 +10,12 @@ from sentence_transformers import (
     SentenceTransformer,
 )
 from torch import Tensor
-NEG_NUM = 1
+from transformers import PreTrainedTokenizerBase, DataCollatorWithPadding
+from dataclasses import dataclass
+import torch.nn.init as init
 
-def dbg(name):
-    def _hook(t):
-        print("!!")
-        if not torch.isfinite(t).all():
-            print(f"[{name}] has Non Finite!", t.min().item(), t.max().item(), flush=True)
-        else:
-            print(t.min().item(), t.max().item(), flush=True)
-    return _hook
+NEG_NUM = 4
+
 class DenseSparseModel(nn.Module):
     """
     Wraps a SentenceTransformer (dense encoder) and adds a sparse‐BOW head.
@@ -65,7 +61,7 @@ class DenseSparseModel(nn.Module):
         Returns:
             torch.Tensor: The dense embeddings.
         """
-        return last_hidden_state[:, 0]
+        return last_hidden_state
 
     def _sparse_embedding(self, hidden_state, input_ids, return_embedding: bool = True):
         # hidden_state: [batch, seq, hsize]
@@ -112,9 +108,9 @@ class DenseSparseModel(nn.Module):
             torch.Tensor: Colbert vector.
         """
         dense_vecs, sparse_vecs = None, None
-        last_hidden_state = self.forward(features)['token_embeddings']
-        dense_vecs = self._dense_embedding(last_hidden_state, features['attention_mask'])
-        sparse_vecs = self._sparse_embedding(last_hidden_state, features['input_ids'])
+        last_hidden_state = self.forward(features)
+        dense_vecs = self._dense_embedding(last_hidden_state['sentence_embedding'], features['attention_mask'])
+        sparse_vecs = self._sparse_embedding(last_hidden_state['token_embeddings'], features['input_ids'])
         dense_vecs = F.normalize(dense_vecs, dim=-1)
         #sparse_vecs = F.normalize(sparse_vecs, dim=-1)
         return dense_vecs, sparse_vecs
@@ -150,6 +146,7 @@ class DenseSparseModel(nn.Module):
     def forward(self, *args, **kwargs):
         # Trainer expects forward() → dense embeddings
         return self.st_model(*args, **kwargs)
+
 
     def save_pretrained(self, output_dir: str, **kwargs):
         """
@@ -362,16 +359,30 @@ class CustomInfoNCELoss(nn.Module):
         loss = self.compute_loss(local_scores, local_targets)
 
         return local_scores, loss
+    
+    def _compute_in_batch_neg_loss(self, q_reps, p_reps, teacher_targets=None, compute_score_func=None, **kwargs):
+        """
+        Compute loss when only using in-batch negatives
+        """
+        group_size = p_reps.size(0) // q_reps.size(0)
 
-    def forward(self, sentence_features: Iterable[dict[str, Tensor]], labels: Tensor) -> Tensor:
-        queries = sentence_features[0]
-        passages = sentence_features[1:]
+        scores = compute_score_func(q_reps, p_reps, **kwargs)   # (batch_size, batch_size * group_size)
+
+        idxs = torch.arange(q_reps.size(0), device=q_reps.device, dtype=torch.long)
+        targets = idxs * group_size # (batch_size)
+        loss = self.compute_loss(scores, targets)
+
+        return scores, loss
+    
+    def forward(self, sentence_features, labels: Tensor) -> Tensor:
+        queries = sentence_features[0]['input_ids']
+        passages = sentence_features[1]['input_ids']
         q_dense_vecs, q_sparse_vecs = self.st_model.encode(queries)  # (batch_size, dim)
         p_dense_vecs, p_sparse_vecs = self.st_model.encode(passages) # (batch_size * group_size, dim)
 
         teacher_targets = None#no teacher score
 
-        compute_loss_func = self._compute_no_in_batch_neg_loss
+        compute_loss_func = self._compute_in_batch_neg_loss
 
         # dense loss
         dense_scores, loss = compute_loss_func(
@@ -444,3 +455,103 @@ def load_triplets(json_path):
                 for i,neg in enumerate(neg_list):
                     rows[f"neg_{i+1}"].append(neg)
     return Dataset.from_dict(rows)
+
+class TripletCollator(DataCollatorWithPadding):
+    """
+    返回:
+      {
+        "queries":  {"input_ids": (B,Lq), "attention_mask": (B,Lq)},
+        "passages": {"input_ids": (B*(1+N),Ld), "attention_mask": (B*(1+N),Ld)},
+        "teacher_scores": None,
+        "no_in_batch_neg_flag": False
+      }
+    """
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        neg_num: int,
+        query_max_len: int = 64,
+        passage_max_len: int = 256,
+        padding: bool | str = True,
+        pad_to_multiple_of: int | None = None,
+        return_tensors: str = "pt",
+        sub_batch_size: int = -1,             # FlagEmbedding 支持切小 sub-batch
+    ):
+        super().__init__(
+            tokenizer=tokenizer,
+            padding=padding,
+            pad_to_multiple_of=pad_to_multiple_of,
+            return_tensors=return_tensors
+        )
+        self.neg_num        = neg_num
+        self.query_max_len  = query_max_len
+        self.passage_max_len= passage_max_len
+        self.sub_batch_size = sub_batch_size  # 若想梯度累积，可以用
+        # 上面 4 个字段就是 AbsEmbedderCollator 里的同名配置
+        self.valid_label_columns = ("labels",)
+        self.return_tensors      = "pt"
+        
+
+    # ------------------------------------------------------
+    def __call__(self, features):
+        """
+        features: List[dict]，每个 dict 至少包含
+          {
+            "query": str,
+            "pos_doc": str,
+            "neg_1": str, ..., "neg_N": str
+          }
+        """
+        B = len(features)
+
+        # 1) 收集文本
+        queries = [f["query"] for f in features]
+
+        passages_flat = []
+        for f in features:
+            # 先正样本，再 N 个负样本（顺序千万别改）
+            passages_flat.append(f["pos_doc"])
+            for i in range(self.neg_num):
+                passages_flat.append(f[f"neg_{i+1}"])
+
+        # 2) tokenizer（与 FlagEmbedding 方式完全一致）
+        q_inputs = self.tokenizer(
+            queries, truncation=True, max_length=self.query_max_len,
+            return_tensors=None   # 先留 dict，稍后 pad
+        )
+        p_inputs = self.tokenizer(
+            passages_flat, truncation=True, max_length=self.passage_max_len,
+            return_tensors=None
+        )
+
+        # 3) pad（FlagEmbedding 支持 sub_batch_size，我们也保留）
+        def _pad(inputs):
+            return self.tokenizer.pad(
+                inputs,
+                padding=self.padding,
+                max_length=self.query_max_len if inputs is q_inputs else self.passage_max_len,
+                pad_to_multiple_of=self.pad_to_multiple_of,
+                return_tensors=self.return_tensors
+            )
+
+        if self.sub_batch_size is None or self.sub_batch_size <= 0:
+            q_collated = _pad(q_inputs)     # dict -> {"input_ids":..., "attention_mask":...}
+            p_collated = _pad(p_inputs)
+        else:
+            # 切小块；和原 AbsEmbedderCollator 一样
+            def _chunk_and_pad(inputs):
+                sub_feats = []
+                bs = self.sub_batch_size
+                for i in range(0, len(inputs["attention_mask"]), bs):
+                    piece = {k: v[i:i+bs] for k,v in inputs.items()}
+                    sub_feats.append(_pad(piece))
+                return sub_feats
+            q_collated = _chunk_and_pad(q_inputs)
+            p_collated = _chunk_and_pad(p_inputs)
+
+        return {
+            "queries_input_ids":  q_collated,
+            "passages_input_ids": p_collated,
+            "teacher_scores": None,       # 你现在没用 teacher
+            "no_in_batch_neg_flag": False # flagembedding 的开关，保持 False 表示需要 in-batch neg
+        }
